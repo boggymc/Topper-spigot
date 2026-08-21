@@ -1,7 +1,6 @@
 package me.hsgamer.topper.spigot.plugin.template;
 
 import io.github.projectunified.minelib.plugin.base.Loadable;
-import io.github.projectunified.minelib.scheduler.async.AsyncScheduler;
 import io.github.projectunified.minelib.scheduler.global.GlobalScheduler;
 import me.hsgamer.topper.agent.core.Agent;
 import me.hsgamer.topper.agent.core.DataEntryAgent;
@@ -38,11 +37,23 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
 public class SpigotTopTemplate extends TopPlayerNumberTemplate implements Loadable {
+    private static final long TICK_MILLIS = 50L;
+
     private final TopperPlugin plugin;
     private final SpigotDataStorageSupplierSettings dataStorageSupplierSettings;
+    private final ScheduledExecutorService lowPriorityThreadPool = Executors.newScheduledThreadPool(
+            2,
+            new LowPriorityThreadFactory()
+    );
 
     public SpigotTopTemplate(TopperPlugin plugin) {
         super(new Settings() {
@@ -86,7 +97,39 @@ public class SpigotTopTemplate extends TopPlayerNumberTemplate implements Loadab
     }
 
     private Agent createTask(Runnable runnable, boolean async, long delay) {
-        return new SpigotRunnableAgent(runnable, async ? AsyncScheduler.get(plugin) : GlobalScheduler.get(plugin), delay);
+        if (!async) {
+            return new SpigotRunnableAgent(runnable, GlobalScheduler.get(plugin), delay);
+        }
+
+        return new Agent() {
+            private ScheduledFuture<?> task;
+
+            @Override
+            public void start() {
+                task = lowPriorityThreadPool.scheduleAtFixedRate(
+                        runnable,
+                        toInitialDelayMillis(delay),
+                        toPeriodMillis(delay),
+                        TimeUnit.MILLISECONDS
+                );
+            }
+
+            @Override
+            public void stop() {
+                if (task != null) {
+                    task.cancel(false);
+                    task = null;
+                }
+            }
+        };
+    }
+
+    private static long toInitialDelayMillis(long ticks) {
+        return Math.max(0L, ticks) * TICK_MILLIS;
+    }
+
+    private static long toPeriodMillis(long ticks) {
+        return Math.max(1L, ticks) * TICK_MILLIS;
     }
 
     @Override
@@ -142,17 +185,16 @@ public class SpigotTopTemplate extends TopPlayerNumberTemplate implements Loadab
         super.enable();
         getEntryConsumeManager().addConsumer(
                 (context) ->
-                        AsyncScheduler.get(plugin).run(
-                                () ->
-                                        Bukkit.getPluginManager().callEvent(new GenericEntryUpdateEvent(
-                                                        context.group,
-                                                        context.holder,
-                                                        context.uuid,
-                                                        context.oldValue,
-                                                        context.value,
-                                                        true
-                                                )
+                        lowPriorityThreadPool.execute(
+                                () -> Bukkit.getPluginManager().callEvent(new GenericEntryUpdateEvent(
+                                                context.group,
+                                                context.holder,
+                                                context.uuid,
+                                                context.oldValue,
+                                                context.value,
+                                                true
                                         )
+                                )
                         )
         );
         getReloadManager().add(new ReloadManager.ReloadEntry() {
@@ -167,6 +209,15 @@ public class SpigotTopTemplate extends TopPlayerNumberTemplate implements Loadab
                 plugin.get(HookSystem.class).reload();
             }
         });
+    }
+
+    @Override
+    public void disable() {
+        try {
+            super.disable();
+        } finally {
+            lowPriorityThreadPool.shutdownNow();
+        }
     }
 
     public void addQueryForwardContext(Plugin plugin, String name, BiFunction<@Nullable UUID, @NotNull String, @NotNull QueryResult> query) {
@@ -189,5 +240,17 @@ public class SpigotTopTemplate extends TopPlayerNumberTemplate implements Loadab
     }
 
     private interface PluginTopQueryForwardContext extends QueryForwardContext<UUID>, PluginContext {
+    }
+
+    private static final class LowPriorityThreadFactory implements ThreadFactory {
+        private final AtomicInteger threadNumber = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "Topper-LowPriority-" + threadNumber.incrementAndGet());
+            thread.setPriority(Thread.MIN_PRIORITY);
+            thread.setDaemon(true);
+            return thread;
+        }
     }
 }
